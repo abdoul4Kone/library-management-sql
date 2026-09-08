@@ -104,7 +104,7 @@ docs/modele_conceptuel.mwb              Modèle MySQL Workbench (ouvrable dans l
 ## Reproduire la base
 
 ```bash
-git clone https://github.com/<TON-PSEUDO>/library-management-sql.git
+git clone https://github.com/abdoul4Kone/library-management-sql.git
 cd library-management-sql
 mysql -u <utilisateur> -p < sql/01_schema_triggers_procedures.sql
 ```
@@ -135,5 +135,5 @@ Projet réalisé en binôme dans le cadre du cursus ENSEA.
 
 > Projet académique réalisé à des fins pédagogiques. L'énoncé original du devoir, propriété de l'ENSEA, n'est pas reproduit dans ce dépôt.
 
-**Abdoulaye KONE** — Statisticien, diplômé de l'ENSEA
+**Abdoulaye KONE** — Analyste Statisticien, diplômé de l'Ecole Nationale Supérieure de Statistique et Economie Appliquée (ENSEA d'Abidjan)
 [LinkedIn](https://linkedin.com/in/abdoulaye-kone)
