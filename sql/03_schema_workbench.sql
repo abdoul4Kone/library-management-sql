@@ -17,7 +17,7 @@ SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,N
 -- -----------------------------------------------------
 -- Schema bibliotecho
 -- -----------------------------------------------------
-CREATE SCHEMA IF NOT EXISTS `bibliotecho` DEFAULT CHARACTER SET latin1 ;
+CREATE SCHEMA IF NOT EXISTS `bibliotecho` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ;
 USE `bibliotecho` ;
 
 -- -----------------------------------------------------
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`adherent` (
   `AbonnementActif` TINYINT(1) NOT NULL DEFAULT 0,
   PRIMARY KEY (`IdAdherent`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`abonnement` (
     REFERENCES `bibliotecho`.`adherent` (`IdAdherent`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`auteur` (
   `Nationalite` VARCHAR(50) NOT NULL,
   PRIMARY KEY (`IdAuteur`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`livre` (
   `NombreExemplairesDisponibles` INT(11) NOT NULL DEFAULT 0,
   PRIMARY KEY (`ISBN`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`exemplaire` (
     REFERENCES `bibliotecho`.`livre` (`ISBN`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`emprunt` (
     FOREIGN KEY (`IdExemplaire`)
     REFERENCES `bibliotecho`.`exemplaire` (`IdExemplaire`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`livreauteur` (
     REFERENCES `bibliotecho`.`auteur` (`IdAuteur`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -168,7 +168,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`penalite` (
     FOREIGN KEY (`IdEmprunt`)
     REFERENCES `bibliotecho`.`emprunt` (`IdEmprunt`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 -- -----------------------------------------------------
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`reservation` (
   `ISBN` VARCHAR(13) NOT NULL,
   `DateReservation` DATE NOT NULL,
   `DateLimiteRecuperation` DATE NOT NULL,
-  `Statut` ENUM('En Attente', 'Expirée', 'Terminée') NOT NULL DEFAULT 'En Attente',
+  `Statut` ENUM('En Attente', 'Notifiée', 'Expirée', 'Terminée') NOT NULL DEFAULT 'En Attente',
   PRIMARY KEY (`IdReservation`),
   INDEX `IdAdherent` (`IdAdherent` ASC) VISIBLE,
   INDEX `ISBN` (`ISBN` ASC) VISIBLE,
@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS `bibliotecho`.`reservation` (
     FOREIGN KEY (`ISBN`)
     REFERENCES `bibliotecho`.`livre` (`ISBN`))
 ENGINE = InnoDB
-DEFAULT CHARACTER SET = latin1;
+DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 
 SET SQL_MODE=@OLD_SQL_MODE;

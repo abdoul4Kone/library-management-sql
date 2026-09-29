@@ -3,6 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Hôte : 127.0.0.1:3308
+-- Export phpMyAdmin historique; le script de référence est 01_schema_triggers_procedures.sql.
 -- Généré le :  Dim 06 avr. 2025 à 06:37
 -- Version du serveur :  5.7.28
 -- Version de PHP :  7.3.12
@@ -27,7 +28,7 @@ DELIMITER $$
 -- Procédures
 --
 DROP PROCEDURE IF EXISTS `enregistrer_retour`$$
-CREATE DEFINER=`root`@`localhost` PROCEDURE `enregistrer_retour` (IN `p_id_emprunt` INT, IN `p_date_retour` DATE)  BEGIN
+CREATE PROCEDURE `enregistrer_retour` (IN `p_id_emprunt` INT, IN `p_date_retour` DATE)  BEGIN
     DECLARE v_retard INT;
     DECLARE v_id_adherent INT;
     DECLARE v_penalite DECIMAL(10,2);
@@ -64,10 +65,11 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `enregistrer_retour` (IN `p_id_empru
 END$$
 
 DROP PROCEDURE IF EXISTS `supprimer_exemplaire_egare`$$
-CREATE DEFINER=`root`@`localhost` PROCEDURE `supprimer_exemplaire_egare` (IN `p_id_exemplaire` INT, IN `p_id_adherent` INT)  BEGIN
+CREATE PROCEDURE `supprimer_exemplaire_egare` (IN `p_id_exemplaire` INT, IN `p_id_adherent` INT)  BEGIN
     DECLARE v_isbn VARCHAR(13);
     DECLARE v_valeur DECIMAL(10,2);
-    DECLARE v_id_emprunt INT;
+    DECLARE v_id_emprunt INT DEFAULT NULL;
+    DECLARE v_statut VARCHAR(20);
     
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
@@ -77,43 +79,52 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `supprimer_exemplaire_egare` (IN `p_
     
     START TRANSACTION;
     
-    -- Trouver l'emprunt actif pour cet exemplaire (s'il existe)
-    SELECT IdEmprunt INTO v_id_emprunt
-    FROM Emprunt
-    WHERE IdExemplaire = p_id_exemplaire AND DateRetourEffective IS NULL
-    LIMIT 1;
+
+    -- La perte doit correspondre à un emprunt actif de cet adhérent.
+    SELECT em.IdEmprunt, ex.ISBN, l.Valeur, ex.Statut
+    INTO v_id_emprunt, v_isbn, v_valeur, v_statut
+    FROM Emprunt em
+    JOIN Exemplaire ex ON ex.IdExemplaire = em.IdExemplaire
+    JOIN Livre l ON ex.ISBN = l.ISBN
+    WHERE em.IdExemplaire = p_id_exemplaire
+      AND em.IdAdherent = p_id_adherent
+      AND em.DateRetourEffective IS NULL
+    FOR UPDATE;
+
+    IF v_id_emprunt IS NULL OR v_statut <> 'Emprunté' THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Aucun emprunt actif de cet exemplaire pour cet adhérent';
+    END IF;
     
-    -- Récupérer l'ISBN et la valeur du livre
-    SELECT e.ISBN, l.Valeur INTO v_isbn, v_valeur
-    FROM Exemplaire e
-    JOIN Livre l ON e.ISBN = l.ISBN
-    WHERE e.IdExemplaire = p_id_exemplaire;
-    
-    -- Enregistrer la pénalité (avec IdEmprunt si trouvé)
+    -- Enregistrer la pénalité liée à l'emprunt.
     INSERT INTO Penalite (IdAdherent, IdEmprunt, Montant, DatePenalite, Statut)
     VALUES (p_id_adherent, v_id_emprunt, v_valeur, CURDATE(), 'En Attente');
     
-    -- Supprimer l'exemplaire
-    DELETE FROM Exemplaire WHERE IdExemplaire = p_id_exemplaire;
+    -- Clôturer l'emprunt puis conserver la copie pour préserver l'historique.
+    UPDATE Emprunt
+    SET DateRetourEffective = CURDATE(), Penalite = v_valeur
+    WHERE IdEmprunt = v_id_emprunt;
+
+    UPDATE Exemplaire
+    SET Statut = 'Perdu'
+    WHERE IdExemplaire = p_id_exemplaire;
     
-    -- Mettre à jour le statut du livre
+    -- Le déclencheur de retour rend la copie disponible juste avant sa perte.
     UPDATE Livre 
     SET NombreExemplairesTotal = NombreExemplairesTotal - 1,
-        NombreExemplairesDisponibles = NombreExemplairesDisponibles - 
-            CASE WHEN (SELECT Statut FROM Exemplaire WHERE IdExemplaire = p_id_exemplaire) = 'Disponible' 
-                 THEN 1 ELSE 0 END
+      NombreExemplairesDisponibles = NombreExemplairesDisponibles - 1
     WHERE ISBN = v_isbn;
     
     COMMIT;
 END$$
 
 DROP PROCEDURE IF EXISTS `traiter_reservations_expirees`$$
-CREATE DEFINER=`root`@`localhost` PROCEDURE `traiter_reservations_expirees` ()  BEGIN
+CREATE PROCEDURE `traiter_reservations_expirees` ()  BEGIN
     DECLARE done INT DEFAULT FALSE;
     DECLARE v_isbn VARCHAR(13);
     DECLARE cur CURSOR FOR 
-        SELECT DISTINCT ISBN FROM Reservation 
-        WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
+        SELECT DISTINCT ISBN FROM Reservation
+        WHERE Statut = 'Notifiée' AND DateLimiteRecuperation < CURDATE();
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
     
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
@@ -123,12 +134,8 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `traiter_reservations_expirees` ()  
     END;
     
     START TRANSACTION;
-    
-    -- Supprimer les réservations expirées
-    DELETE FROM Reservation 
-    WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
-    
-    -- Pour chaque livre concerné, notifier la prochaine réservation
+
+    -- Traiter la file avant de supprimer les réservations expirées.
     OPEN cur;
     read_loop: LOOP
         FETCH cur INTO v_isbn;
@@ -137,19 +144,37 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `traiter_reservations_expirees` ()  
         END IF;
         
         -- Notifier la prochaine réservation en attente
+    UPDATE Reservation
+    SET Statut = 'Expirée'
+    WHERE ISBN = v_isbn
+      AND Statut = 'Notifiée'
+      AND DateLimiteRecuperation < CURDATE();
+
+    IF EXISTS (
+      SELECT 1 FROM Livre
+      WHERE ISBN = v_isbn AND NombreExemplairesDisponibles > 0
+    ) THEN
         UPDATE Reservation
         SET Statut = 'Notifiée',
             DateLimiteRecuperation = DATE_ADD(CURDATE(), INTERVAL 3 DAY)
         WHERE ISBN = v_isbn
         AND Statut = 'En Attente'
         AND IdReservation = (
-            SELECT MIN(r.IdReservation)
-            FROM Reservation r
-            WHERE r.ISBN = v_isbn
-            AND r.Statut = 'En Attente'
+            SELECT prochaine.IdReservation
+            FROM (
+              SELECT r.IdReservation
+              FROM Reservation r
+              WHERE r.ISBN = v_isbn AND r.Statut = 'En Attente'
+              ORDER BY r.DateReservation, r.IdReservation
+              LIMIT 1
+            ) AS prochaine
         );
+          END IF;
     END LOOP;
     CLOSE cur;
+
+    DELETE FROM Reservation
+    WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
     
     COMMIT;
 END$$
@@ -172,17 +197,18 @@ CREATE TABLE IF NOT EXISTS `abonnement` (
   `Statut` enum('Actif','Expiré') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'Actif',
   PRIMARY KEY (`IdAbonnement`),
   KEY `IdAdherent` (`IdAdherent`)
-) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
 -- Déchargement des données de la table `abonnement`
 --
 
 INSERT INTO `abonnement` (`IdAbonnement`, `IdAdherent`, `DateDebut`, `DateFin`, `Montant`, `Statut`) VALUES
-(1, 1, '2023-01-01', '2023-12-31', '5000.00', 'Actif'),
-(2, 2, '2023-02-01', '2023-11-30', '5000.00', 'Actif'),
-(3, 3, '2023-03-01', '2023-10-31', '5000.00', 'Actif'),
-(4, 5, '2023-05-01', '2023-09-30', '5000.00', 'Actif');
+(1, 1, CURDATE(), LAST_DAY(CURDATE()), '5000.00', 'Actif'),
+(2, 2, CURDATE(), LAST_DAY(CURDATE()), '5000.00', 'Actif'),
+(3, 3, CURDATE(), LAST_DAY(CURDATE()), '5000.00', 'Actif'),
+(4, 4, CURDATE(), LAST_DAY(CURDATE()), '5000.00', 'Actif'),
+(5, 5, CURDATE(), LAST_DAY(CURDATE()), '5000.00', 'Actif');
 
 -- --------------------------------------------------------
 
@@ -207,11 +233,11 @@ CREATE TABLE IF NOT EXISTS `adherent` (
 --
 
 INSERT INTO `adherent` (`IdAdherent`, `Nom`, `Prenom`, `Adresse`, `Telephone`, `DateInscription`, `AbonnementActif`) VALUES
-(1, 'Dupont', 'Jean', '1 rue de Paris', '0612345678', '2023-01-10', 1),
-(2, 'Martin', 'Sophie', '5 avenue des Champs', '0623456789', '2023-02-15', 1),
-(3, 'Bernard', 'Pierre', '10 rue de Lyon', '0634567890', '2023-03-20', 1),
-(4, 'Petit', 'Marie', '15 boulevard Voltaire', '0645678901', '2023-04-25', 0),
-(5, 'Durand', 'Luc', '20 avenue Foch', '0656789012', '2023-05-30', 1);
+(1, 'Membre', 'Test 1', 'Adresse fictive 1', '0000000001', '2023-01-10', 1),
+(2, 'Membre', 'Test 2', 'Adresse fictive 2', '0000000002', '2023-02-15', 1),
+(3, 'Membre', 'Test 3', 'Adresse fictive 3', '0000000003', '2023-03-20', 1),
+(4, 'Membre', 'Test 4', 'Adresse fictive 4', '0000000004', '2023-04-25', 1),
+(5, 'Membre', 'Test 5', 'Adresse fictive 5', '0000000005', '2023-05-30', 1);
 
 -- --------------------------------------------------------
 
@@ -226,7 +252,7 @@ CREATE TABLE IF NOT EXISTS `auteur` (
   `Prenom` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
   `Nationalite` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
   PRIMARY KEY (`IdAuteur`)
-) ENGINE=InnoDB AUTO_INCREMENT=21 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
 -- Déchargement des données de la table `auteur`
@@ -237,22 +263,7 @@ INSERT INTO `auteur` (`IdAuteur`, `Nom`, `Prenom`, `Nationalite`) VALUES
 (2, 'Orwell', 'George', 'Britannique'),
 (3, 'Asimov', 'Isaac', 'Américaine'),
 (4, 'Rowling', 'J.K.', 'Britannique'),
-(5, 'Christie', 'Agatha', 'Britannique'),
-(6, 'Hugo', 'Victor', 'Française'),
-(7, 'Orwell', 'George', 'Britannique'),
-(8, 'Asimov', 'Isaac', 'Américaine'),
-(9, 'Rowling', 'J.K.', 'Britannique'),
-(10, 'Christie', 'Agatha', 'Britannique'),
-(11, 'Hugo', 'Victor', 'Française'),
-(12, 'Orwell', 'George', 'Britannique'),
-(13, 'Asimov', 'Isaac', 'Américaine'),
-(14, 'Rowling', 'J.K.', 'Britannique'),
-(15, 'Christie', 'Agatha', 'Britannique'),
-(16, 'Hugo', 'Victor', 'Française'),
-(17, 'Orwell', 'George', 'Britannique'),
-(18, 'Asimov', 'Isaac', 'Américaine'),
-(19, 'Rowling', 'J.K.', 'Britannique'),
-(20, 'Christie', 'Agatha', 'Britannique');
+(5, 'Christie', 'Agatha', 'Britannique');
 
 -- --------------------------------------------------------
 
@@ -272,18 +283,20 @@ CREATE TABLE IF NOT EXISTS `emprunt` (
   PRIMARY KEY (`IdEmprunt`),
   KEY `IdAdherent` (`IdAdherent`),
   KEY `IdExemplaire` (`IdExemplaire`)
-) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=8 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
 -- Déchargement des données de la table `emprunt`
 --
 
 INSERT INTO `emprunt` (`IdEmprunt`, `IdAdherent`, `IdExemplaire`, `DateDebut`, `DateRetourPrevue`, `DateRetourEffective`, `Penalite`) VALUES
-(1, 1, 1, '2023-06-01', '2023-06-16', '2023-06-18', '1000.00'),
-(2, 1, 4, '2023-06-05', '2023-06-20', '2023-06-27', '3500.00'),
-(3, 2, 6, '2023-06-10', '2023-06-25', NULL, '0.00'),
-(4, 3, 8, '2023-06-15', '2023-06-30', NULL, '0.00'),
-(5, 5, 11, '2023-06-20', '2023-07-05', NULL, '0.00');
+(1, 1, 1, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), DATE_SUB(CURDATE(), INTERVAL 3 DAY), '1000.00'),
+(2, 1, 4, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), DATE_SUB(CURDATE(), INTERVAL 3 DAY), '1000.00'),
+(3, 2, 6, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), '0.00'),
+(4, 3, 8, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), '0.00'),
+(5, 5, 11, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), '0.00'),
+(6, 2, 2, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), CURDATE(), '25.00'),
+(7, 3, 12, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY), CURDATE(), '15.00');
 
 --
 -- Déclencheurs `emprunt`
@@ -302,6 +315,34 @@ DROP TRIGGER IF EXISTS `limite_emprunts_question_3`;
 DELIMITER $$
 CREATE TRIGGER `limite_emprunts_question_3` BEFORE INSERT ON `emprunt` FOR EACH ROW BEGIN
     DECLARE nb_emprunts INT;
+    DECLARE abonnement_actif INT;
+    DECLARE exemplaire_disponible INT;
+
+    SELECT COUNT(*) INTO abonnement_actif
+    FROM Abonnement
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut = 'Actif'
+      AND CURDATE() BETWEEN DateDebut AND DateFin;
+
+    IF abonnement_actif = 0 THEN
+      SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Un abonnement actif est requis pour emprunter';
+    END IF;
+
+    IF NEW.DateRetourPrevue < NEW.DateDebut
+       OR NEW.DateRetourPrevue > DATE_ADD(NEW.DateDebut, INTERVAL 15 DAY) THEN
+      SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'La durée d''un emprunt ne peut pas dépasser 15 jours';
+    END IF;
+
+    SELECT COUNT(*) INTO exemplaire_disponible
+    FROM Exemplaire
+    WHERE IdExemplaire = NEW.IdExemplaire AND Statut = 'Disponible';
+
+    IF exemplaire_disponible = 0 THEN
+      SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Cet exemplaire n''est pas disponible';
+    END IF;
     
     SELECT COUNT(*) INTO nb_emprunts 
     FROM Emprunt 
@@ -384,17 +425,17 @@ CREATE TABLE IF NOT EXISTS `exemplaire` (
 
 INSERT INTO `exemplaire` (`IdExemplaire`, `ISBN`, `Statut`) VALUES
 (1, '9782070360028', 'Disponible'),
-(2, '9782070360028', 'Disponible'),
+(2, '9782070360028', 'Perdu'),
 (3, '9782070360028', 'Disponible'),
 (4, '9782070360530', 'Disponible'),
 (5, '9782070360530', 'Disponible'),
-(6, '9782290032726', 'Emprunté'),
+(6, '9782290032726', 'Disponible'),
 (7, '9782290032726', 'Disponible'),
-(8, '9782070584621', 'Emprunté'),
+(8, '9782070584621', 'Disponible'),
 (9, '9782070584621', 'Disponible'),
 (10, '9782070584621', 'Disponible'),
-(11, '9782070584621', 'Emprunté'),
-(12, '9782253004247', 'Disponible'),
+(11, '9782070584621', 'Disponible'),
+(12, '9782253004247', 'Perdu'),
 (13, '9782253004247', 'Disponible');
 
 --
@@ -414,7 +455,7 @@ DROP TRIGGER IF EXISTS `supprime_question_1`;
 DELIMITER $$
 CREATE TRIGGER `supprime_question_1` AFTER DELETE ON `exemplaire` FOR EACH ROW BEGIN
     UPDATE Livre 
-    SET NombreExemplairesTotal = NombreExemplairesTotal - 1,
+    SET NombreExemplairesTotal = NombreExemplairesTotal - IF(OLD.Statut = 'Perdu', 0, 1),
         NombreExemplairesDisponibles = NombreExemplairesDisponibles - 
             CASE WHEN OLD.Statut = 'Disponible' THEN 1 ELSE 0 END
     WHERE ISBN = OLD.ISBN;
@@ -447,11 +488,11 @@ CREATE TABLE IF NOT EXISTS `livre` (
 --
 
 INSERT INTO `livre` (`ISBN`, `Titre`, `AnneeEdition`, `Editeur`, `Genre`, `Valeur`, `DateAchat`, `NombreExemplairesTotal`, `NombreExemplairesDisponibles`) VALUES
-('9782070360028', 'Les Misérables', 1862, 'Gallimard', 'Roman', '25.00', '2023-01-15', 6, 6),
-('9782070360530', '1984', 1949, 'Gallimard', 'Science-Fiction', '20.00', '2023-02-20', 4, 4),
-('9782070584621', 'Harry Potter à l\'école des sorciers', 1997, 'Gallimard', 'Fantasy', '22.00', '2023-04-05', 8, 6),
-('9782253004247', 'Le Crime de l\'Orient-Express', 1934, 'Le Livre de Poche', 'Policier', '15.00', '2023-05-12', 4, 4),
-('9782290032726', 'Fondation', 1951, 'J\'ai lu', 'Science-Fiction', '18.00', '2023-03-10', 4, 3);
+('9782070360028', 'Les Misérables', 1862, 'Gallimard', 'Roman', '25.00', '2023-01-15', 2, 2),
+('9782070360530', '1984', 1949, 'Gallimard', 'Science-Fiction', '20.00', '2023-02-20', 2, 2),
+('9782070584621', 'Harry Potter à l\'école des sorciers', 1997, 'Gallimard', 'Fantasy', '22.00', '2023-04-05', 4, 4),
+('9782253004247', 'Le Crime de l\'Orient-Express', 1934, 'Le Livre de Poche', 'Policier', '15.00', '2023-05-12', 1, 1),
+('9782290032726', 'Fondation', 1951, 'J\'ai lu', 'Science-Fiction', '18.00', '2023-03-10', 2, 2);
 
 -- --------------------------------------------------------
 
@@ -495,21 +536,17 @@ CREATE TABLE IF NOT EXISTS `penalite` (
   PRIMARY KEY (`IdPenalite`),
   KEY `IdAdherent` (`IdAdherent`),
   KEY `IdEmprunt` (`IdEmprunt`)
-) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
 -- Déchargement des données de la table `penalite`
 --
 
 INSERT INTO `penalite` (`IdPenalite`, `IdAdherent`, `IdEmprunt`, `Montant`, `DatePenalite`, `Statut`) VALUES
-(1, 1, 1, '1000.00', '2025-04-06', 'En Attente'),
-(2, 1, 2, '3500.00', '2025-04-06', 'En Attente'),
-(3, 1, 1, '1000.00', '2025-04-06', 'En Attente'),
-(4, 1, 2, '3500.00', '2025-04-06', 'En Attente'),
-(5, 1, 1, '1000.00', '2025-04-06', 'En Attente'),
-(6, 1, 2, '3500.00', '2025-04-06', 'En Attente'),
-(7, 1, 1, '1000.00', '2025-04-06', 'En Attente'),
-(8, 1, 2, '3500.00', '2025-04-06', 'En Attente');
+(1, 1, 1, '1000.00', CURDATE(), 'En Attente'),
+(2, 1, 2, '1000.00', CURDATE(), 'En Attente'),
+(3, 2, 6, '25.00', CURDATE(), 'En Attente'),
+(4, 3, 7, '15.00', CURDATE(), 'En Attente');
 
 -- --------------------------------------------------------
 
@@ -524,20 +561,68 @@ CREATE TABLE IF NOT EXISTS `reservation` (
   `ISBN` varchar(13) COLLATE utf8mb4_unicode_ci NOT NULL,
   `DateReservation` date NOT NULL,
   `DateLimiteRecuperation` date NOT NULL,
-  `Statut` enum('En Attente','Expirée','Terminée') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'En Attente',
+  `Statut` enum('En Attente','Notifiée','Expirée','Terminée') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'En Attente',
   PRIMARY KEY (`IdReservation`),
   KEY `IdAdherent` (`IdAdherent`),
   KEY `ISBN` (`ISBN`)
-) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
 -- Déchargement des données de la table `reservation`
 --
 
 INSERT INTO `reservation` (`IdReservation`, `IdAdherent`, `ISBN`, `DateReservation`, `DateLimiteRecuperation`, `Statut`) VALUES
-(1, 4, '9782070360028', '2023-06-25', '2023-06-28', 'En Attente'),
-(2, 2, '9782290032726', '2023-06-26', '2023-06-29', 'En Attente'),
-(3, 3, '9782070584621', '2023-06-27', '2023-06-30', 'En Attente');
+(2, 2, '9782070360028', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'Notifiée'),
+(3, 3, '9782070584621', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(4, 4, '9782253004247', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(5, 5, '9782070360530', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(6, 1, '9782290032726', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente');
+
+-- Déclencheur de validation des réservations
+DELIMITER $$
+CREATE TRIGGER `verifier_reservation` BEFORE INSERT ON `reservation` FOR EACH ROW BEGIN
+    DECLARE abonnement_actif INT;
+    DECLARE exemplaires_existants INT;
+    DECLARE nb_emprunts INT;
+    DECLARE nb_reservations INT;
+    DECLARE limite_reservations INT;
+
+    SELECT COUNT(*) INTO abonnement_actif
+    FROM Abonnement
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut = 'Actif'
+      AND CURDATE() BETWEEN DateDebut AND DateFin;
+
+    IF abonnement_actif = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Un abonnement actif est requis pour réserver';
+    END IF;
+
+    SELECT COUNT(*) INTO exemplaires_existants
+    FROM Exemplaire
+    WHERE ISBN = NEW.ISBN AND Statut <> 'Perdu';
+
+    IF exemplaires_existants = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Ce livre ne possède aucun exemplaire';
+    END IF;
+
+    SELECT COUNT(*) INTO nb_emprunts
+    FROM Emprunt
+    WHERE IdAdherent = NEW.IdAdherent AND DateRetourEffective IS NULL;
+
+    SELECT COUNT(*) INTO nb_reservations
+    FROM Reservation
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut IN ('En Attente', 'Notifiée');
+
+    SET limite_reservations = IF(nb_emprunts >= 3, 1, 2);
+    IF nb_reservations >= limite_reservations THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Limite de réservations atteinte pour cet adhérent';
+    END IF;
+END$$
+DELIMITER ;
 
 --
 -- Contraintes pour les tables déchargées

@@ -1,7 +1,7 @@
 -- On crée la base de données avec un encodage qui supporte les caractères spéciaux
-CREATE DATABASE IF NOT EXISTS BiblioTecho CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS bibliotecho CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 -- On se positionne sur la base qu'on vient de créer
-USE BiblioTecho;
+USE bibliotecho;
 
 -- ****************************************************************************
 -- ************************************TABLES**********************************
@@ -107,7 +107,7 @@ CREATE TABLE Reservation (
     ISBN VARCHAR(13) NOT NULL,                    -- Quel livre (pas d'exemplaire spécifique)
     DateReservation DATE NOT NULL,                -- Quand la réservation a été faite
     DateLimiteRecuperation DATE NOT NULL,         -- Date limite pour venir chercher le livre
-    Statut ENUM('En Attente', 'Expirée', 'Terminée') DEFAULT 'En Attente' NOT NULL,
+    Statut ENUM('En Attente', 'Notifiée', 'Expirée', 'Terminée') DEFAULT 'En Attente' NOT NULL,
     
     -- Contrôle d'intégrité référentielle
     FOREIGN KEY (IdAdherent) REFERENCES Adherent(IdAdherent),
@@ -159,7 +159,7 @@ BEGIN
     /* Ce trigger s'active après suppression d'un exemplaire
        et ajuste les compteurs en fonction du statut de l'exemplaire supprimé */
     UPDATE Livre 
-    SET NombreExemplairesTotal = NombreExemplairesTotal - 1,
+    SET NombreExemplairesTotal = NombreExemplairesTotal - CASE WHEN OLD.Statut = 'Perdu' THEN 0 ELSE 1 END,
         NombreExemplairesDisponibles = NombreExemplairesDisponibles - 
             CASE WHEN OLD.Statut = 'Disponible' THEN 1 ELSE 0 END
     WHERE ISBN = OLD.ISBN;
@@ -215,6 +215,34 @@ FOR EACH ROW
 BEGIN
     /* Empêche un adhérent d'avoir plus de 3 emprunts simultanés */
     DECLARE nb_emprunts INT;
+    DECLARE abonnement_actif INT;
+    DECLARE exemplaire_disponible INT;
+
+    SELECT COUNT(*) INTO abonnement_actif
+    FROM Abonnement
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut = 'Actif'
+      AND CURDATE() BETWEEN DateDebut AND DateFin;
+
+    IF abonnement_actif = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Un abonnement actif est requis pour emprunter';
+    END IF;
+
+    IF NEW.DateRetourPrevue < NEW.DateDebut
+       OR NEW.DateRetourPrevue > DATE_ADD(NEW.DateDebut, INTERVAL 15 DAY) THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'La durée d''un emprunt ne peut pas dépasser 15 jours';
+    END IF;
+
+    SELECT COUNT(*) INTO exemplaire_disponible
+    FROM Exemplaire
+    WHERE IdExemplaire = NEW.IdExemplaire AND Statut = 'Disponible';
+
+    IF exemplaire_disponible = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Cet exemplaire n''est pas disponible';
+    END IF;
     
     SELECT COUNT(*) INTO nb_emprunts 
     FROM Emprunt 
@@ -281,6 +309,54 @@ BEGIN
 END //
 DELIMITER ;
 
+DELIMITER //
+CREATE TRIGGER verifier_reservation
+BEFORE INSERT ON Reservation
+FOR EACH ROW
+BEGIN
+    DECLARE abonnement_actif INT;
+    DECLARE exemplaires_existants INT;
+    DECLARE nb_emprunts INT;
+    DECLARE nb_reservations INT;
+    DECLARE limite_reservations INT;
+
+    SELECT COUNT(*) INTO abonnement_actif
+    FROM Abonnement
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut = 'Actif'
+      AND CURDATE() BETWEEN DateDebut AND DateFin;
+
+    IF abonnement_actif = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Un abonnement actif est requis pour réserver';
+    END IF;
+
+    SELECT COUNT(*) INTO exemplaires_existants
+    FROM Exemplaire
+    WHERE ISBN = NEW.ISBN AND Statut <> 'Perdu';
+
+    IF exemplaires_existants = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Ce livre ne possède aucun exemplaire';
+    END IF;
+
+    SELECT COUNT(*) INTO nb_emprunts
+    FROM Emprunt
+    WHERE IdAdherent = NEW.IdAdherent AND DateRetourEffective IS NULL;
+
+    SELECT COUNT(*) INTO nb_reservations
+    FROM Reservation
+    WHERE IdAdherent = NEW.IdAdherent
+      AND Statut IN ('En Attente', 'Notifiée');
+
+    SET limite_reservations = IF(nb_emprunts >= 3, 1, 2);
+    IF nb_reservations >= limite_reservations THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Limite de réservations atteinte pour cet adhérent';
+    END IF;
+END //
+DELIMITER ;
+
 -- ****************************************************************************
 -- QUESTION 6 : Transaction pour exemplaire égaré
 -- "Mettre en place une transaction permettant de supprimer un exemplaire
@@ -293,12 +369,11 @@ CREATE PROCEDURE supprimer_exemplaire_egare(
     IN p_id_adherent INT
 )
 BEGIN
-    /* Procédure transactionnelle pour :
-       1. Enregistrer une pénalité pour l'adhérent
-       2. Supprimer l'exemplaire perdu
-       3. Mettre à jour les compteurs */
+    /* La copie reste dans le catalogue afin de préserver l'historique d'emprunt. */
     DECLARE v_isbn VARCHAR(13);
     DECLARE v_valeur DECIMAL(10,2);
+    DECLARE v_id_emprunt INT DEFAULT NULL;
+    DECLARE v_statut VARCHAR(20);
     
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
@@ -308,25 +383,39 @@ BEGIN
     
     START TRANSACTION;
     
-    -- Récupérer l'ISBN et la valeur du livre
-    SELECT e.ISBN, l.Valeur INTO v_isbn, v_valeur
-    FROM Exemplaire e
-    JOIN Livre l ON e.ISBN = l.ISBN
-    WHERE e.IdExemplaire = p_id_exemplaire;
+    -- La perte doit correspondre à un emprunt actif de cet adhérent.
+    SELECT em.IdEmprunt, ex.ISBN, l.Valeur, ex.Statut
+    INTO v_id_emprunt, v_isbn, v_valeur, v_statut
+    FROM Emprunt em
+    JOIN Exemplaire ex ON ex.IdExemplaire = em.IdExemplaire
+    JOIN Livre l ON ex.ISBN = l.ISBN
+    WHERE em.IdExemplaire = p_id_exemplaire
+      AND em.IdAdherent = p_id_adherent
+      AND em.DateRetourEffective IS NULL
+    FOR UPDATE;
+
+    IF v_id_emprunt IS NULL OR v_statut <> 'Emprunté' THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Aucun emprunt actif de cet exemplaire pour cet adhérent';
+    END IF;
     
     -- Enregistrer la pénalité (valeur du livre)
     INSERT INTO Penalite (IdAdherent, IdEmprunt, Montant, DatePenalite, Statut)
-    VALUES (p_id_adherent, NULL, v_valeur, CURDATE(), 'En Attente');
+    VALUES (p_id_adherent, v_id_emprunt, v_valeur, CURDATE(), 'En Attente');
     
-    -- Supprimer l'exemplaire
-    DELETE FROM Exemplaire WHERE IdExemplaire = p_id_exemplaire;
+    -- Clôturer l'emprunt et conserver la copie pour préserver l'historique.
+    UPDATE Emprunt
+    SET DateRetourEffective = CURDATE(), Penalite = v_valeur
+    WHERE IdEmprunt = v_id_emprunt;
+
+    UPDATE Exemplaire
+    SET Statut = 'Perdu'
+    WHERE IdExemplaire = p_id_exemplaire;
     
-    -- Mettre à jour les compteurs du livre
+    -- Le déclencheur de retour a rendu la copie disponible juste avant sa perte.
     UPDATE Livre 
     SET NombreExemplairesTotal = NombreExemplairesTotal - 1,
-        NombreExemplairesDisponibles = NombreExemplairesDisponibles - 
-            CASE WHEN (SELECT Statut FROM Exemplaire WHERE IdExemplaire = p_id_exemplaire) = 'Disponible' 
-                 THEN 1 ELSE 0 END
+        NombreExemplairesDisponibles = NombreExemplairesDisponibles - 1
     WHERE ISBN = v_isbn;
     
     COMMIT;
@@ -352,6 +441,8 @@ BEGIN
     DECLARE v_retard INT;
     DECLARE v_id_adherent INT;
     DECLARE v_penalite DECIMAL(10,2);
+    DECLARE v_date_debut DATE;
+    DECLARE v_date_retour_effective DATE;
     
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
@@ -362,10 +453,18 @@ BEGIN
     START TRANSACTION;
     
     -- Calculer le retard en jours (500 FCFA par jour)
-    SELECT DATEDIFF(p_date_retour, DateRetourPrevue), IdAdherent 
-    INTO v_retard, v_id_adherent
+    SELECT DATEDIFF(p_date_retour, DateRetourPrevue), IdAdherent,
+           DateDebut, DateRetourEffective
+    INTO v_retard, v_id_adherent, v_date_debut, v_date_retour_effective
     FROM Emprunt
-    WHERE IdEmprunt = p_id_emprunt;
+    WHERE IdEmprunt = p_id_emprunt
+    FOR UPDATE;
+
+    IF v_retard IS NULL OR v_date_retour_effective IS NOT NULL
+       OR p_date_retour < v_date_debut THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Emprunt introuvable, déjà clôturé ou date de retour invalide';
+    END IF;
     
     -- Mettre à jour l'emprunt
     UPDATE Emprunt 
@@ -390,10 +489,10 @@ DELIMITER ;
 -- "Ecrire une requête SQL permettant d'enregistrer le paiement d'une pénalité."
 -- ****************************************************************************
 
+SET @id_penalite = NULL; -- Renseigner l'identifiant avant d'exécuter la requête
 UPDATE Penalite
-SET Statut = 'Payée',
-    DatePenalite = CURDATE()
-WHERE IdPenalite = [id_penalite]; -- À remplacer par l'ID réel
+SET Statut = 'Payée'
+WHERE IdPenalite = @id_penalite;
 
 -- ****************************************************************************
 -- QUESTION 9 : Désactivation abonnements expirés
@@ -408,9 +507,13 @@ WHERE DateFin < CURDATE() AND Statut = 'Actif';
 
 -- Met à jour le statut des adhérents concernés
 UPDATE Adherent a
-JOIN Abonnement ab ON a.IdAdherent = ab.IdAdherent
-SET a.AbonnementActif = FALSE
-WHERE ab.DateFin < CURDATE() AND ab.Statut = 'Expiré';
+SET a.AbonnementActif = EXISTS (
+        SELECT 1
+        FROM Abonnement ab
+        WHERE ab.IdAdherent = a.IdAdherent
+            AND ab.Statut = 'Actif'
+            AND CURDATE() BETWEEN ab.DateDebut AND ab.DateFin
+);
 
 -- ****************************************************************************
 -- QUESTION 10 : Mise à jour réservations
@@ -420,20 +523,25 @@ WHERE ab.DateFin < CURDATE() AND ab.Statut = 'Expiré';
 -- Marque les réservations expirées (non récupérées dans les 3 jours)
 UPDATE Reservation
 SET Statut = 'Expirée'
-WHERE DateLimiteRecuperation < CURDATE() AND Statut = 'En Attente';
+WHERE DateLimiteRecuperation < CURDATE() AND Statut = 'Notifiée';
 
 -- Notifie la prochaine réservation en attente quand un exemplaire est disponible
 UPDATE Reservation r
+JOIN (
+    SELECT IdReservation
+    FROM (
+        SELECT IdReservation,
+               ROW_NUMBER() OVER (PARTITION BY ISBN ORDER BY DateReservation, IdReservation) AS rang_file
+        FROM Reservation
+        WHERE Statut = 'En Attente'
+    ) AS reservations_classees
+    WHERE rang_file = 1
+) AS prochaine ON prochaine.IdReservation = r.IdReservation
 JOIN Livre l ON r.ISBN = l.ISBN
-SET r.Statut = 'Notifiée'
-WHERE l.NombreExemplairesDisponibles > 0 
-AND r.Statut = 'En Attente'
-AND r.IdReservation = (
-    SELECT MIN(r2.IdReservation)
-    FROM Reservation r2
-    WHERE r2.ISBN = r.ISBN
-    AND r2.Statut = 'En Attente'
-);
+SET r.Statut = 'Notifiée',
+    r.DateLimiteRecuperation = DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+WHERE l.NombreExemplairesDisponibles > 0
+  AND r.Statut = 'En Attente';
 
 -- ****************************************************************************
 -- QUESTION 11 : Transaction pour réservations expirées
@@ -450,9 +558,10 @@ BEGIN
        2. Notifier les suivants dans la file d'attente */
     DECLARE done INT DEFAULT FALSE;
     DECLARE v_isbn VARCHAR(13);
-    DECLARE cur CURSOR FOR 
-        SELECT DISTINCT ISBN FROM Reservation 
-        WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
+    DECLARE cur CURSOR FOR
+        SELECT DISTINCT ISBN
+        FROM Reservation
+        WHERE Statut = 'Notifiée' AND DateLimiteRecuperation < CURDATE();
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
     
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
@@ -463,11 +572,7 @@ BEGIN
     
     START TRANSACTION;
     
-    -- Supprimer les réservations expirées
-    DELETE FROM Reservation 
-    WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
-    
-    -- Pour chaque livre concerné, notifier la prochaine réservation en attente
+    -- Capturer et traiter la file avant de supprimer les réservations expirées.
     OPEN cur;
     read_loop: LOOP
         FETCH cur INTO v_isbn;
@@ -476,18 +581,36 @@ BEGIN
         END IF;
         
         UPDATE Reservation
-        SET Statut = 'Notifiée',
-            DateLimiteRecuperation = DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+        SET Statut = 'Expirée'
         WHERE ISBN = v_isbn
-        AND Statut = 'En Attente'
-        AND IdReservation = (
-            SELECT MIN(r.IdReservation)
-            FROM Reservation r
-            WHERE r.ISBN = v_isbn
-            AND r.Statut = 'En Attente'
-        );
+          AND Statut = 'Notifiée'
+          AND DateLimiteRecuperation < CURDATE();
+
+        IF EXISTS (
+            SELECT 1 FROM Livre
+            WHERE ISBN = v_isbn AND NombreExemplairesDisponibles > 0
+        ) THEN
+            UPDATE Reservation
+            SET Statut = 'Notifiée',
+                DateLimiteRecuperation = DATE_ADD(CURDATE(), INTERVAL 3 DAY)
+            WHERE ISBN = v_isbn
+              AND Statut = 'En Attente'
+              AND IdReservation = (
+                  SELECT prochaine.IdReservation
+                  FROM (
+                      SELECT r.IdReservation
+                      FROM Reservation r
+                      WHERE r.ISBN = v_isbn AND r.Statut = 'En Attente'
+                      ORDER BY r.DateReservation, r.IdReservation
+                      LIMIT 1
+                  ) AS prochaine
+              );
+        END IF;
     END LOOP;
     CLOSE cur;
+
+    DELETE FROM Reservation
+    WHERE Statut = 'Expirée' AND DateLimiteRecuperation < CURDATE();
     
     COMMIT;
 END //
@@ -510,11 +633,11 @@ INSERT INTO Auteur (Nom, Prenom, Nationalite) VALUES
 
 -- Insertion de livres
 INSERT INTO Livre (ISBN, Titre, AnneeEdition, Editeur, Genre, Valeur, DateAchat, NombreExemplairesTotal, NombreExemplairesDisponibles) VALUES
-('9782070360028', 'Les Misérables', 1862, 'Gallimard', 'Roman', 25.00, '2023-01-15', 3, 3),
-('9782070360530', '1984', 1949, 'Gallimard', 'Science-Fiction', 20.00, '2023-02-20', 2, 2),
-('9782290032726', 'Fondation', 1951, 'J''ai lu', 'Science-Fiction', 18.00, '2023-03-10', 2, 2),
-('9782070584621', 'Harry Potter à l''école des sorciers', 1997, 'Gallimard', 'Fantasy', 22.00, '2023-04-05', 4, 4),
-('9782253004247', 'Le Crime de l''Orient-Express', 1934, 'Le Livre de Poche', 'Policier', 15.00, '2023-05-12', 2, 2);
+('9782070360028', 'Les Misérables', 1862, 'Gallimard', 'Roman', 25.00, '2023-01-15', 0, 0),
+('9782070360530', '1984', 1949, 'Gallimard', 'Science-Fiction', 20.00, '2023-02-20', 0, 0),
+('9782290032726', 'Fondation', 1951, 'J''ai lu', 'Science-Fiction', 18.00, '2023-03-10', 0, 0),
+('9782070584621', 'Harry Potter à l''école des sorciers', 1997, 'Gallimard', 'Fantasy', 22.00, '2023-04-05', 0, 0),
+('9782253004247', 'Le Crime de l''Orient-Express', 1934, 'Le Livre de Poche', 'Policier', 15.00, '2023-05-12', 0, 0);
 
 -- Insertion de relations Livre-Auteur
 INSERT INTO LivreAuteur (ISBN, IdAuteur) VALUES
@@ -542,36 +665,53 @@ INSERT INTO Exemplaire (ISBN, Statut) VALUES
 
 -- Insertion d'adhérents
 INSERT INTO Adherent (Nom, Prenom, Adresse, Telephone, DateInscription, AbonnementActif) VALUES
-('Dupont', 'Jean', '1 rue de Paris', '0612345678', '2023-01-10', TRUE),
-('Martin', 'Sophie', '5 avenue des Champs', '0623456789', '2023-02-15', TRUE),
-('Bernard', 'Pierre', '10 rue de Lyon', '0634567890', '2023-03-20', TRUE),
-('Petit', 'Marie', '15 boulevard Voltaire', '0645678901', '2023-04-25', FALSE),
-('Durand', 'Luc', '20 avenue Foch', '0656789012', '2023-05-30', TRUE);
+('Membre', 'Test 1', 'Adresse fictive 1', '0000000001', '2023-01-10', TRUE),
+('Membre', 'Test 2', 'Adresse fictive 2', '0000000002', '2023-02-15', TRUE),
+('Membre', 'Test 3', 'Adresse fictive 3', '0000000003', '2023-03-20', TRUE),
+('Membre', 'Test 4', 'Adresse fictive 4', '0000000004', '2023-04-25', TRUE),
+('Membre', 'Test 5', 'Adresse fictive 5', '0000000005', '2023-05-30', TRUE);
 
 -- Insertion d'abonnements
 INSERT INTO Abonnement (IdAdherent, DateDebut, DateFin, Montant, Statut) VALUES
-(1, '2023-01-01', '2023-12-31', 5000.00, 'Actif'),
-(2, '2023-02-01', '2023-11-30', 5000.00, 'Actif'),
-(3, '2023-03-01', '2023-10-31', 5000.00, 'Actif'),
-(5, '2023-05-01', '2023-09-30', 5000.00, 'Actif');
+(1, STR_TO_DATE(DATE_FORMAT(CURDATE(), '%Y-%m-01'), '%Y-%m-%d'), LAST_DAY(CURDATE()), 5000.00, 'Actif'),
+(2, STR_TO_DATE(DATE_FORMAT(CURDATE(), '%Y-%m-01'), '%Y-%m-%d'), LAST_DAY(CURDATE()), 5000.00, 'Actif'),
+(3, STR_TO_DATE(DATE_FORMAT(CURDATE(), '%Y-%m-01'), '%Y-%m-%d'), LAST_DAY(CURDATE()), 5000.00, 'Actif'),
+(4, STR_TO_DATE(DATE_FORMAT(CURDATE(), '%Y-%m-01'), '%Y-%m-%d'), LAST_DAY(CURDATE()), 5000.00, 'Actif'),
+(5, STR_TO_DATE(DATE_FORMAT(CURDATE(), '%Y-%m-01'), '%Y-%m-%d'), LAST_DAY(CURDATE()), 5000.00, 'Actif');
 
 -- Insertion d'emprunts
 INSERT INTO Emprunt (IdAdherent, IdExemplaire, DateDebut, DateRetourPrevue) VALUES
-(1, 1, '2023-06-01', '2023-06-16'),
-(1, 4, '2023-06-05', '2023-06-20'),
-(2, 6, '2023-06-10', '2023-06-25'),
-(3, 8, '2023-06-15', '2023-06-30'),
-(5, 11, '2023-06-20', '2023-07-05');
+(1, 1, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(1, 4, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(2, 6, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(3, 8, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(5, 11, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(2, 2, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY)),
+(3, 12, DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 5 DAY));
 
 -- Insertion de réservations
 INSERT INTO Reservation (IdAdherent, ISBN, DateReservation, DateLimiteRecuperation, Statut) VALUES
-(4, '9782070360028', '2023-06-25', '2023-06-28', 'En Attente'),
-(2, '9782290032726', '2023-06-26', '2023-06-29', 'En Attente'),
-(3, '9782070584621', '2023-06-27', '2023-06-30', 'En Attente');
+(1, '9782070360028', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(2, '9782070360028', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(3, '9782070584621', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(4, '9782253004247', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(5, '9782070360530', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente'),
+(1, '9782290032726', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'En Attente');
 
 -- Enregistrement de retours avec pénalités
-CALL enregistrer_retour(1, '2023-06-18'); -- 2 jours de retard
-CALL enregistrer_retour(2, '2023-06-27'); -- 2 jours de retard
+CALL enregistrer_retour(1, DATE_SUB(CURDATE(), INTERVAL 3 DAY)); -- 2 jours de retard
+CALL enregistrer_retour(2, DATE_SUB(CURDATE(), INTERVAL 3 DAY)); -- 2 jours de retard
+CALL enregistrer_retour(3, DATE_SUB(CURDATE(), INTERVAL 5 DAY));
+CALL enregistrer_retour(4, DATE_SUB(CURDATE(), INTERVAL 5 DAY));
+CALL enregistrer_retour(5, DATE_SUB(CURDATE(), INTERVAL 5 DAY));
+
+UPDATE Reservation
+SET Statut = 'Notifiée', DateLimiteRecuperation = DATE_SUB(CURDATE(), INTERVAL 4 DAY)
+WHERE IdReservation = 1;
+CALL traiter_reservations_expirees();
+
+CALL supprimer_exemplaire_egare(2, 2);
+CALL supprimer_exemplaire_egare(12, 3);
 
 
 
